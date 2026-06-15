@@ -175,6 +175,11 @@ func ListContainers(socketPath string, enforceNetworkValidation bool) ([]Contain
 	useContainerIpAddresses := true
 	hostContainerId := ""
 
+	// When enforceNetworkValidation is on, build the set of network IDs the
+	// host container shares with workloads; reused below to filter swarm
+	// services to the same contract.
+	allowedNetworkIDs := map[string]struct{}{}
+
 	// Create a new Docker client
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -200,10 +205,13 @@ func ListContainers(socketPath string, enforceNetworkValidation bool) ([]Contain
 		// We can use the host container to filter out the list of returned containers
 		hostContainerId = hostContainer.ID
 
-		for hostContainerNetworkName := range hostContainer.NetworkSettings.Networks {
+		for hostContainerNetworkName, endpoint := range hostContainer.NetworkSettings.Networks {
 			// If we're enforcing network validation, we'll filter on the host containers networks
 			if enforceNetworkValidation {
 				containerFilters.Add("network", hostContainerNetworkName)
+				if endpoint != nil && endpoint.NetworkID != "" {
+					allowedNetworkIDs[endpoint.NetworkID] = struct{}{}
+				}
 			}
 
 			// If the container is on the docker bridge network, we will use IP addresses over hostnames
@@ -309,6 +317,24 @@ func ListContainers(socketPath string, enforceNetworkValidation bool) ([]Contain
 		dockerContainers = append(dockerContainers, dockerContainer)
 	}
 
+	// In a Swarm cluster ContainerList only returns tasks scheduled on the
+	// local daemon, so a single Newt instance sees ~1/Nth of the workload set.
+	// On manager nodes, enrich the list with cluster-wide service entries so
+	// Pangolin's label discovery can see every stack deployed to the cluster.
+	if isSwarmManager(ctx, cli) {
+		swarmFilter := allowedNetworkIDs
+		if !enforceNetworkValidation {
+			swarmFilter = nil
+		}
+		serviceEntries, err := listSwarmServiceContainers(ctx, cli, swarmFilter)
+		if err != nil {
+			logger.Warn("Failed to list swarm services, continuing with container-only view: %v", err)
+		} else {
+			logger.Debug("Appending %d swarm service entries to container list", len(serviceEntries))
+			dockerContainers = append(dockerContainers, serviceEntries...)
+		}
+	}
+
 	return dockerContainers, nil
 }
 
@@ -377,60 +403,90 @@ func (em *EventMonitor) Start() error {
 	logger.Debug("Starting Docker event monitoring")
 
 	// Filter for container events we care about
-	eventFilters := make(client.Filters)
-	eventFilters.Add("type", "container")
-	// eventFilters.Add("event", "create")
-	eventFilters.Add("event", "start")
-	eventFilters.Add("event", "stop")
-	// eventFilters.Add("event", "destroy")
-	// eventFilters.Add("event", "die")
-	// eventFilters.Add("event", "pause")
-	// eventFilters.Add("event", "unpause")
+	containerFilters := make(client.Filters)
+	containerFilters.Add("type", "container")
+	// containerFilters.Add("event", "create")
+	containerFilters.Add("event", "start")
+	containerFilters.Add("event", "stop")
+	// containerFilters.Add("event", "destroy")
+	// containerFilters.Add("event", "die")
+	// containerFilters.Add("event", "pause")
+	// containerFilters.Add("event", "unpause")
 
-	// Start listening for events
+	em.consumeEvents("container", containerFilters)
+
+	// On swarm managers, also react to service lifecycle changes so that
+	// stack deploys/updates/removals trigger a fresh ListContainers run.
+	// A separate filter is required because Docker's event filter ANDs across
+	// keys: combining type=service with the container-only start/stop event
+	// list would silently drop all service events (which use create, update,
+	// and remove actions).
+	detectCtx, detectCancel := context.WithTimeout(em.ctx, 5*time.Second)
+	isManager := isSwarmManager(detectCtx, em.client)
+	detectCancel()
+
+	if isManager {
+		serviceFilters := make(client.Filters)
+		serviceFilters.Add("type", "service")
+		serviceFilters.Add("event", "create")
+		serviceFilters.Add("event", "update")
+		serviceFilters.Add("event", "remove")
+		em.consumeEvents("service", serviceFilters)
+	}
+
+	return nil
+}
+
+// consumeEvents subscribes to events matching filters and dispatches each
+// one to handleEvent. Restarts the stream on transient errors. Exits when
+// the EventMonitor's context is cancelled.
+func (em *EventMonitor) consumeEvents(label string, eventFilters client.Filters) {
 	eventsResult := em.client.Events(em.ctx, client.EventsListOptions{
 		Filters: eventFilters,
 	})
 	eventCh, errCh := eventsResult.Messages, eventsResult.Err
 
 	go func() {
-		defer func() {
-			if err := em.client.Close(); err != nil {
-				logger.Error("Error closing Docker client: %v", err)
-			}
-		}()
-
 		for {
 			select {
 			case event := <-eventCh:
-				logger.Debug("Docker event received: %s %s for container %s", event.Action, event.Type, event.Actor.ID[:12])
+				logger.Debug("Docker event received: %s %s for %s %s", event.Action, event.Type, event.Type, shortEventActorID(event.Actor.ID))
 
 				// Fetch updated container list and trigger callback
 				go em.handleEvent(event)
 
 			case err := <-errCh:
 				if err != nil && err != context.Canceled {
-					logger.Error("Docker event stream error: %v", err)
+					logger.Error("Docker %s event stream error: %v", label, err)
 					// Try to reconnect after a brief delay
 					time.Sleep(5 * time.Second)
 					if em.ctx.Err() == nil {
-						logger.Info("Attempting to reconnect to Docker event stream")
+						logger.Info("Attempting to reconnect to Docker %s event stream", label)
 						eventsResult = em.client.Events(em.ctx, client.EventsListOptions{
 							Filters: eventFilters,
 						})
 						eventCh, errCh = eventsResult.Messages, eventsResult.Err
+						continue
 					}
 				}
 				return
 
 			case <-em.ctx.Done():
-				logger.Info("Docker event monitoring stopped")
+				logger.Info("Docker %s event monitoring stopped", label)
 				return
 			}
 		}
 	}()
+}
 
-	return nil
+// shortEventActorID returns the first 12 characters of a Docker event actor
+// ID, falling back to the full string when shorter to avoid slicing panics
+// on non-container-shaped events.
+func shortEventActorID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
 }
 
 // handleEvent processes a Docker event and triggers the callback with updated container list
@@ -453,5 +509,10 @@ func (em *EventMonitor) Stop() {
 	logger.Info("Stopping Docker event monitoring")
 	if em.cancel != nil {
 		em.cancel()
+	}
+	if em.client != nil {
+		if err := em.client.Close(); err != nil {
+			logger.Error("Error closing Docker client: %v", err)
+		}
 	}
 }
