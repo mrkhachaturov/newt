@@ -444,6 +444,7 @@ func Load(opts Options) (newtpkg.Config, error) {
 		cfg.LocalEndpointInterfaces = names
 		sources["local-endpoint-interfaces"] = string(sourceEnv)
 	}
+	applyEnvStr(&cfg.PreferEndpoint, "PREFER_ENDPOINT", "prefer-endpoint", sources)
 
 	applyEnvStr(&pingIntervalStr, "PING_INTERVAL", "ping-interval", sources)
 	applyEnvStr(&pingTimeoutStr, "PING_TIMEOUT", "ping-timeout", sources)
@@ -515,6 +516,7 @@ func Load(opts Options) (newtpkg.Config, error) {
 	origNoCloud, origTLSPrivateKey := cfg.NoCloud, cfg.TLSPrivateKey
 	localEndpointInterfacesStr := strings.Join(cfg.LocalEndpointInterfaces, ",")
 	origLocalEndpointInterfaces := localEndpointInterfacesStr
+	origPreferEndpoint := cfg.PreferEndpoint
 	origMetrics, origOTLP, origAdminAddr := cfg.MetricsEnabled, cfg.OTLPEnabled, cfg.AdminAddr
 	origMetricsAsync, origPprof, origRegion := cfg.MetricsAsyncBytes, cfg.PprofEnabled, cfg.Region
 	origADKey, origADPrincipals, origADCACert := cfg.AuthDaemonKey, cfg.AuthDaemonPrincipalsFile, cfg.AuthDaemonCACertPath
@@ -611,6 +613,7 @@ func Load(opts Options) (newtpkg.Config, error) {
 	markCLI("udp-proxy-idle-timeout", udpProxyIdleTimeoutStr != origUDPIdle)
 	markCLI("provisioning-key", cfg.ProvisioningKey != origProvisioningKey)
 	markCLI("name", cfg.NewtName != origName)
+	markCLI("prefer-endpoint", cfg.PreferEndpoint != origPreferEndpoint)
 	markCLI("tls-client-cert-file", cfg.TLSClientCert != origTLSCert)
 	markCLI("tls-client-key", cfg.TLSClientKey != origTLSKey)
 	markCLI("tls-client-cert", cfg.TLSPrivateKey != origTLSPrivateKey)
